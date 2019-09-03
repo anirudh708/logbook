@@ -13,7 +13,6 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -61,13 +60,14 @@ class LocalResponseTest {
 
     @Test
     void shouldUseDifferentBodyAfterWrite() throws IOException {
-        unit.getOutputStream().write("Hello".getBytes());
-        final byte[] body1 = unit.getBody();
+        unit.withBody();
 
-        unit.getOutputStream().write("World".getBytes());
-        final byte[] body2 = unit.getBody();
+        final ServletOutputStream stream = unit.getOutputStream();
+        stream.write("Hello".getBytes());
+        assertThat(unit.getBodyAsString(), is("Hello"));
 
-        assertNotSame(body1, body2);
+        stream.write(" World".getBytes());
+        assertThat(unit.getBodyAsString(), is("Hello World"));
     }
 
     @Test
@@ -80,6 +80,7 @@ class LocalResponseTest {
         assertSame(os1, os2);
 
         verify(mock).getOutputStream();
+        verify(mock).getCharacterEncoding();
         verifyNoMoreInteractions(mock);
     }
 
@@ -120,7 +121,7 @@ class LocalResponseTest {
     }
 
     @Test
-    void shouldAllowWithBodyAfterWithoutBody() throws IOException {
+    void shouldAllowWithBodyAfterWithoutBody() {
         unit.withoutBody();
         unit.withBody();
     }

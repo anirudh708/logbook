@@ -36,12 +36,14 @@ final class DefaultLogbook implements Logbook {
             final HttpRequest processedRequest = strategy.process(request);
 
             return () -> {
+                // TODO shouldn't this filter run before the strategy?
                 final HttpRequest filteredRequest = requestFilter.filter(processedRequest);
                 strategy.write(precorrelation, filteredRequest, sink);
                 return originalResponse -> {
                     final HttpResponse response = new CachingHttpResponse(originalResponse);
                     final HttpResponse processedResponse = strategy.process(request, response);
                     return () -> {
+                        // TODO shouldn't this filter run before the strategy?
                         final HttpResponse filteredResponse = responseFilter.filter(processedResponse);
                         strategy.write(precorrelation.correlate(), filteredRequest, filteredResponse, sink);
                     };

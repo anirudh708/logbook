@@ -1,6 +1,7 @@
 package org.zalando.logbook.servlet;
 
 import lombok.AllArgsConstructor;
+import org.zalando.fauxpas.ThrowingUnaryOperator;
 import org.zalando.logbook.Headers;
 import org.zalando.logbook.HttpResponse;
 import org.zalando.logbook.Origin;
@@ -19,7 +20,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.function.Supplier;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -27,9 +28,7 @@ final class LocalResponse extends HttpServletResponseWrapper implements HttpResp
 
     private final String protocolVersion;
 
-    private Tee body;
-    private Tee buffer;
-    private boolean used; // point of no return, once we exposed our stream, we need to buffer
+    private final AtomicReference<State> state = new AtomicReference<>(new Unbuffered());
 
     LocalResponse(final HttpServletResponse response, final String protocolVersion) {
         super(response);
@@ -63,88 +62,178 @@ final class LocalResponse extends HttpServletResponseWrapper implements HttpResp
     }
 
     @Override
-    public HttpResponse withBody() throws IOException {
-        if (body == null) {
-            bufferIfNecessary();
-            this.body = buffer;
-        }
+    public HttpResponse withBody() {
+        transitionTo(State::withBody);
         return this;
-    }
-
-    private void bufferIfNecessary() throws IOException {
-        if (buffer == null) {
-            this.buffer = new Tee(super.getOutputStream());
-        }
     }
 
     @Override
     public HttpResponse withoutBody() {
-        this.body = null;
-        if (!used) {
-            this.buffer = null;
-        }
+        transitionTo(State::withoutBody);
         return this;
     }
 
     @Override
     public ServletOutputStream getOutputStream() throws IOException {
-        if (buffer == null) {
-            return super.getOutputStream();
-        } else {
-            this.used = true;
-            return buffer.getOutputStream();
-        }
+        return transitionTo(State::expose).getOutputStream();
     }
 
     @Override
     public PrintWriter getWriter() throws IOException {
-        if (buffer == null) {
-            return super.getWriter();
-        } else {
-            this.used = true;
-            return buffer.getWriter(this::getCharset);
-        }
+        return transitionTo(State::expose).getWriter();
     }
 
     @Override
     public byte[] getBody() {
-        return body == null ? new byte[0] : body.getBytes();
+        return state.get().getBody();
     }
 
-    private static class Tee {
+    private State transitionTo(final ThrowingUnaryOperator<State, IOException> transition) {
+        return state.updateAndGet(transition);
+    }
+
+    private abstract class State {
+
+        byte[] EMPTY = new byte[0];
+
+        State withBody() {
+            return this;
+        }
+
+        State withoutBody() {
+            return this;
+        }
+
+        State expose() throws IOException {
+            return this;
+        }
+
+        ServletOutputStream getOutputStream() throws IOException {
+            return LocalResponse.super.getOutputStream();
+        }
+
+        PrintWriter getWriter() throws IOException {
+            return LocalResponse.super.getWriter();
+        }
+
+        byte[] getBody() {
+            return EMPTY;
+        }
+
+    }
+
+    private final class Unbuffered extends State {
+
+        @Override
+        public State withBody() {
+            return new Offering();
+        }
+
+        @Override
+        public State expose() {
+            return new Passing();
+        }
+
+    }
+
+    private final class Offering extends State {
+
+        @Override
+        public State withoutBody() {
+            return new Unbuffered();
+        }
+
+        @Override
+        public State expose() throws IOException {
+            return new Buffering();
+        }
+
+    }
+
+    private final class Passing extends State {
+
+    }
+
+    @AllArgsConstructor
+    private final class Buffering extends State {
+
+        private final Tee buffer;
+
+        private Buffering() throws IOException {
+            this(new Tee(LocalResponse.super.getOutputStream(), LocalResponse.this.getCharset()));
+        }
+
+        @Override
+        public State withoutBody() {
+            return new Ignoring(buffer);
+        }
+
+        @Override
+        public ServletOutputStream getOutputStream() {
+            return buffer.getOutputStream();
+        }
+
+        @Override
+        public PrintWriter getWriter() {
+            return buffer.getWriter();
+        }
+
+        @Override
+        byte[] getBody() {
+            return buffer.getBytes();
+        }
+    }
+
+    @AllArgsConstructor
+    private final class Ignoring extends State {
+
+        private final Tee buffer;
+
+        @Override
+        public State withBody() {
+            return new Buffering(buffer);
+        }
+
+        @Override
+        public ServletOutputStream getOutputStream() {
+            return buffer.getOutputStream();
+        }
+
+        @Override
+        public PrintWriter getWriter() {
+            return buffer.getWriter();
+        }
+
+    }
+
+    private static final class Tee {
 
         private final ByteArrayOutputStream branch;
         private final TeeServletOutputStream output;
+        private final PrintWriter writer;
 
-        private PrintWriter writer;
-        private byte[] bytes;
-
-        private Tee(final ServletOutputStream original) {
+        private Tee(final ServletOutputStream original, final Charset charset) {
             this.branch = new ByteArrayOutputStream();
             this.output = new TeeServletOutputStream(original, branch);
+            this.writer = new PrintWriter(new OutputStreamWriter(output, charset));
         }
 
         ServletOutputStream getOutputStream() {
             return output;
         }
 
-        PrintWriter getWriter(final Supplier<Charset> charset) {
-            if (writer == null) {
-                writer = new PrintWriter(new OutputStreamWriter(output, charset.get()));
-            }
+        PrintWriter getWriter() {
             return writer;
         }
 
         byte[] getBytes() {
-            if (bytes == null) {
-                bytes = branch.toByteArray();
-            }
-            return bytes;
+            return branch.toByteArray();
         }
+
     }
 
     @AllArgsConstructor
-    private static class TeeServletOutputStream extends ServletOutputStream {
+    private static final class TeeServletOutputStream extends ServletOutputStream {
 
         private final ServletOutputStream original;
         private final OutputStream branch;
@@ -184,4 +273,5 @@ final class LocalResponse extends HttpServletResponseWrapper implements HttpResp
         }
 
     }
+
 }

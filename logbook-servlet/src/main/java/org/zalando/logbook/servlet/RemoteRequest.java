@@ -1,6 +1,8 @@
 package org.zalando.logbook.servlet;
 
+import lombok.AllArgsConstructor;
 import lombok.SneakyThrows;
+import org.zalando.fauxpas.ThrowingUnaryOperator;
 import org.zalando.logbook.Headers;
 import org.zalando.logbook.HttpRequest;
 import org.zalando.logbook.Origin;
@@ -20,17 +22,17 @@ import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Collections.list;
 import static java.util.stream.Collectors.joining;
+import static org.zalando.logbook.servlet.ByteStreams.toByteArray;
 
 final class RemoteRequest extends HttpServletRequestWrapper implements HttpRequest {
 
     private final FormRequestMode formRequestMode = FormRequestMode.fromProperties();
-
-    private byte[] body;
-    private byte[] buffered;
+    private final AtomicReference<State> state = new AtomicReference<>(new Unbuffered());
 
     RemoteRequest(final HttpServletRequest request) {
         super(request);
@@ -92,38 +94,50 @@ final class RemoteRequest extends HttpServletRequestWrapper implements HttpReque
     }
 
     @Override
-    public HttpRequest withBody() throws IOException {
-        if (body == null) {
-            bufferIfNecessary();
-            this.body = buffered;
-        }
-
+    public HttpRequest withBody() {
+        transitionTo(State::withBody);
         return this;
-    }
-
-    private void bufferIfNecessary() throws IOException {
-        if (buffered == null) {
-            if (isFormRequest()) {
-                switch (formRequestMode) {
-                    case PARAMETER:
-                        this.buffered = reconstructBodyFromParameters();
-                        return;
-                    case OFF:
-                        this.buffered = new byte[0];
-                        return;
-                    default:
-                        break;
-                }
-            }
-
-            this.buffered = ByteStreams.toByteArray(super.getInputStream());
-        }
     }
 
     @Override
     public HttpRequest withoutBody() {
-        this.body = null;
+        transitionTo(State::withoutBody);
         return this;
+    }
+
+    @SneakyThrows
+    static String encode(final String s, final String charset) {
+        return URLEncoder.encode(s, charset);
+    }
+
+    @Override
+    public ServletInputStream getInputStream() throws IOException {
+        return transitionTo(State::expose).getInputStream();
+    }
+
+    @Override
+    public BufferedReader getReader() throws IOException {
+        return transitionTo(State::expose).getReader();
+    }
+
+    @Override
+    public byte[] getBody() {
+        return transitionTo(State::expose).getBody();
+    }
+
+    private byte[] buffer() throws IOException {
+        if (isFormRequest()) {
+            switch (formRequestMode) {
+                case PARAMETER:
+                    return reconstructBodyFromParameters();
+                case OFF:
+                    return new byte[0];
+                default:
+                    break;
+            }
+        }
+
+        return toByteArray(super.getInputStream());
     }
 
     private boolean isFormRequest() {
@@ -150,25 +164,123 @@ final class RemoteRequest extends HttpServletRequestWrapper implements HttpReque
         return encode(s, "UTF-8");
     }
 
-    @SneakyThrows
-    static String encode(final String s, final String charset) {
-        return URLEncoder.encode(s, charset);
+    private State transitionTo(final ThrowingUnaryOperator<State, IOException> transition) {
+        return state.updateAndGet(transition);
     }
 
-    @Override
-    public ServletInputStream getInputStream() throws IOException {
-        return buffered == null ?
-                super.getInputStream() :
-                new ServletInputStreamAdapter(new ByteArrayInputStream(buffered));
+    private abstract class State {
+
+        byte[] EMPTY = new byte[0];
+
+        State withBody() {
+            return this;
+        }
+
+        State withoutBody() {
+            return this;
+        }
+
+        State expose() throws IOException {
+            return this;
+        }
+
+        ServletInputStream getInputStream() throws IOException {
+            return RemoteRequest.super.getInputStream();
+        }
+
+        BufferedReader getReader() throws IOException {
+            return RemoteRequest.super.getReader();
+        }
+
+        byte[] getBody() {
+            return EMPTY;
+        }
+
     }
 
-    @Override
-    public BufferedReader getReader() throws IOException {
-        return new BufferedReader(new InputStreamReader(getInputStream(), getCharset()));
+    private final class Unbuffered extends State {
+
+        @Override
+        public State withBody() {
+            return new Offering();
+        }
+
+        @Override
+        public State expose() {
+            return new Passing();
+        }
+
     }
 
-    @Override
-    public byte[] getBody() {
-        return body == null ? new byte[0] : body;
+    private final class Offering extends State {
+
+        @Override
+        public State withoutBody() {
+            return new Unbuffered();
+        }
+
+        @Override
+        public State expose() throws IOException {
+            return new Buffering();
+        }
+
     }
+
+    private final class Passing extends State {
+
+    }
+
+    @AllArgsConstructor
+    private final class Buffering extends State {
+
+        private final byte[] buffer;
+
+        private Buffering() throws IOException {
+            this(RemoteRequest.this.buffer());
+        }
+
+        @Override
+        public State withoutBody() {
+            return new Ignoring(buffer);
+        }
+
+        @Override
+        public ServletInputStream getInputStream() {
+            return new ServletInputStreamAdapter(new ByteArrayInputStream(buffer));
+        }
+
+        @Override
+        public BufferedReader getReader() {
+            return new BufferedReader(new InputStreamReader(getInputStream(), getCharset()));
+        }
+
+        @Override
+        public byte[] getBody() {
+            return buffer;
+        }
+
+    }
+
+    @AllArgsConstructor
+    private final class Ignoring extends State {
+
+        private final byte[] buffer;
+
+        @Override
+        public State withBody() {
+            return new Buffering(buffer);
+        }
+
+        @Override
+        public ServletInputStream getInputStream() {
+            return new ServletInputStreamAdapter(new ByteArrayInputStream(buffer));
+        }
+
+        @Override
+        public BufferedReader getReader() {
+            return new BufferedReader(new InputStreamReader(getInputStream(), getCharset()));
+        }
+
+    }
+
 }

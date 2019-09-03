@@ -18,6 +18,19 @@ final class BodyReplacementHttpRequest implements ForwardingHttpRequest {
     }
 
     @Override
+    public HttpRequest withBody() {
+        // TODO this might be too late, i.e. no one is calling this
+        request.withoutBody();
+        return this;
+    }
+
+    @Override
+    public HttpRequest withoutBody() {
+        // TODO set replacement to empty string?!
+        return this;
+    }
+
+    @Override
     public byte[] getBody() {
         return replacement.getBytes(UTF_8);
     }
